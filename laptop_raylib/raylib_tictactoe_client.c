@@ -5,7 +5,6 @@
 #include <stdbool.h>
 #include <mosquitto.h>
 
-#define BROKER_HOST "cppcs2600mqtt.duckdns.org"
 #define BROKER_PORT 1883
 
 #define TOPIC_P1_MOVE "ttt/move/player1"
@@ -15,9 +14,14 @@
 #define TOPIC_MODE    "ttt/mode"
 
 static struct mosquitto *mosq = NULL;
+
+static char broker_host[128] = "";
+static bool connected = false;
+static bool typing_url = true;
+
 static char board[10] = "123456789";
 static char turn = 'X';
-static char status[64] = "WAITING";
+static char status[64] = "NOT_CONNECTED";
 static int mode = 2;
 
 void parse_state(char *msg) {
@@ -28,9 +32,7 @@ void parse_state(char *msg) {
 
     if (board_ptr) {
         board_ptr += 6;
-        for (int i = 0; i < 9; i++) {
-            board[i] = board_ptr[i];
-        }
+        for (int i = 0; i < 9; i++) board[i] = board_ptr[i];
         board[9] = '\0';
     }
 
@@ -58,9 +60,7 @@ void parse_state(char *msg) {
 void on_message(struct mosquitto *m, void *userdata, const struct mosquitto_message *msg) {
     char payload[256];
 
-    if (msg->payloadlen >= (int)sizeof(payload)) {
-        return;
-    }
+    if (msg->payloadlen >= (int)sizeof(payload)) return;
 
     memcpy(payload, msg->payload, msg->payloadlen);
     payload[msg->payloadlen] = '\0';
@@ -70,7 +70,35 @@ void on_message(struct mosquitto *m, void *userdata, const struct mosquitto_mess
     }
 }
 
+bool connect_to_broker(void) {
+    mosq = mosquitto_new("raylib_laptop_client", true, NULL);
+
+    if (!mosq) {
+        strcpy(status, "MQTT_CLIENT_ERROR");
+        return false;
+    }
+
+    mosquitto_message_callback_set(mosq, on_message);
+
+    if (mosquitto_connect(mosq, broker_host, BROKER_PORT, 60) != MOSQ_ERR_SUCCESS) {
+        strcpy(status, "CONNECT_FAILED");
+        mosquitto_destroy(mosq);
+        mosq = NULL;
+        return false;
+    }
+
+    mosquitto_subscribe(mosq, NULL, TOPIC_STATE, 0);
+    mosquitto_loop_start(mosq);
+
+    connected = true;
+    strcpy(status, "CONNECTED");
+
+    return true;
+}
+
 void publish_move(int position) {
+    if (!connected || mosq == NULL) return;
+
     char move[8];
     snprintf(move, sizeof(move), "%d", position);
 
@@ -82,44 +110,70 @@ void publish_move(int position) {
 }
 
 void publish_simple(const char *topic, const char *msg) {
+    if (!connected || mosq == NULL) return;
     mosquitto_publish(mosq, NULL, topic, strlen(msg), msg, 0, false);
+}
+
+void handle_url_input(void) {
+    int key = GetCharPressed();
+
+    while (key > 0) {
+        int len = strlen(broker_host);
+
+        if (len < 127 && key >= 32 && key <= 126) {
+            broker_host[len] = (char)key;
+            broker_host[len + 1] = '\0';
+        }
+
+        key = GetCharPressed();
+    }
+
+    if (IsKeyPressed(KEY_BACKSPACE)) {
+        int len = strlen(broker_host);
+        if (len > 0) {
+            broker_host[len - 1] = '\0';
+        }
+    }
+
+    if (IsKeyPressed(KEY_ENTER)) {
+        if (strlen(broker_host) > 0) {
+            connect_to_broker();
+        }
+    }
 }
 
 int main(void) {
     mosquitto_lib_init();
 
-    mosq = mosquitto_new("raylib_laptop_client", true, NULL);
-
-    if (!mosq) {
-        printf("Could not create MQTT client.\n");
-        return 1;
-    }
-
-    mosquitto_message_callback_set(mosq, on_message);
-
-    if (mosquitto_connect(mosq, BROKER_HOST, BROKER_PORT, 60) != MOSQ_ERR_SUCCESS) {
-        printf("Could not connect to MQTT broker.\n");
-        return 1;
-    }
-
-    mosquitto_subscribe(mosq, NULL, TOPIC_STATE, 0);
-    mosquitto_loop_start(mosq);
-
-    InitWindow(600, 700, "CS2600 MQTT Tic-Tac-Toe");
+    InitWindow(700, 760, "CS2600 MQTT Tic-Tac-Toe");
     SetTargetFPS(60);
 
     while (!WindowShouldClose()) {
         BeginDrawing();
         ClearBackground(RAYWHITE);
 
-        DrawText("MQTT Tic-Tac-Toe", 150, 30, 32, BLACK);
+        DrawText("MQTT Tic-Tac-Toe", 190, 25, 32, BLACK);
 
-        char info[128];
+        DrawText("Enter GCP IP or DuckDNS URL:", 70, 80, 22, BLACK);
+
+        Rectangle input_box = {70, 115, 560, 45};
+        DrawRectangleLinesEx(input_box, 2, BLACK);
+        DrawText(broker_host, 80, 127, 22, DARKBLUE);
+
+        if (!connected) {
+            DrawText("Press ENTER to connect", 70, 170, 20, DARKGRAY);
+            DrawText(status, 70, 200, 20, RED);
+            handle_url_input();
+        } else {
+            DrawText("Connected to MQTT broker", 70, 170, 20, DARKGREEN);
+        }
+
+        char info[160];
         snprintf(info, sizeof(info), "Turn: %c   Status: %s   Mode: %d-player", turn, status, mode);
-        DrawText(info, 80, 90, 20, DARKGRAY);
+        DrawText(info, 70, 230, 20, DARKGRAY);
 
-        int start_x = 90;
-        int start_y = 150;
+        int start_x = 140;
+        int start_y = 280;
         int cell = 140;
 
         for (int i = 0; i < 9; i++) {
@@ -136,16 +190,12 @@ int main(void) {
             text[1] = '\0';
 
             Color color = DARKGRAY;
-
-            if (board[i] == 'X') {
-                color = BLUE;
-            } else if (board[i] == 'O') {
-                color = RED;
-            }
+            if (board[i] == 'X') color = BLUE;
+            if (board[i] == 'O') color = RED;
 
             DrawText(text, x + 50, y + 40, 60, color);
 
-            if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+            if (connected && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
                 Vector2 mouse = GetMousePosition();
 
                 if (CheckCollisionPointRec(mouse, rect)) {
@@ -156,9 +206,9 @@ int main(void) {
             }
         }
 
-        Rectangle reset_btn = {90, 600, 120, 50};
-        Rectangle one_btn = {240, 600, 120, 50};
-        Rectangle two_btn = {390, 600, 120, 50};
+        Rectangle reset_btn = {110, 710, 120, 40};
+        Rectangle one_btn = {290, 710, 120, 40};
+        Rectangle two_btn = {470, 710, 120, 40};
 
         DrawRectangleRec(reset_btn, LIGHTGRAY);
         DrawRectangleRec(one_btn, LIGHTGRAY);
@@ -168,11 +218,11 @@ int main(void) {
         DrawRectangleLinesEx(one_btn, 2, BLACK);
         DrawRectangleLinesEx(two_btn, 2, BLACK);
 
-        DrawText("Reset", 120, 615, 22, BLACK);
-        DrawText("1P", 285, 615, 22, BLACK);
-        DrawText("2P", 435, 615, 22, BLACK);
+        DrawText("Reset", 140, 720, 20, BLACK);
+        DrawText("1 Player", 310, 720, 20, BLACK);
+        DrawText("2 Player", 490, 720, 20, BLACK);
 
-        if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+        if (connected && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
             Vector2 mouse = GetMousePosition();
 
             if (CheckCollisionPointRec(mouse, reset_btn)) {
@@ -191,11 +241,13 @@ int main(void) {
         EndDrawing();
     }
 
-    CloseWindow();
+    if (mosq != NULL) {
+        mosquitto_loop_stop(mosq, true);
+        mosquitto_destroy(mosq);
+    }
 
-    mosquitto_loop_stop(mosq, true);
-    mosquitto_destroy(mosq);
     mosquitto_lib_cleanup();
+    CloseWindow();
 
     return 0;
 }
